@@ -1,0 +1,167 @@
+# Build and deploy updated code to a Cloud Services Extended Support instance
+trigger: none
+variables:
+  solution: '**/*.sln'
+  buildPlatform: 'Any CPU'
+  buildConfiguration: 'Release'
+  cloudServiceProject: '**/*.ccproj'
+  targetProfile: 'Cloud'
+  CloudService1Name: 'paired-cloud-service1'
+  CloudService2Name: 'paired-cloud-service2'
+  PackageFileName: 'CloudServiceForSwap.cspkg'
+  ResourceGroupName: 'cloud-service-rg'
+
+jobs:
+- job: cloudservicebuildforswap
+  pool:
+    vmImage: 'windows-latest'
+
+  steps:
+  - task: NuGetToolInstaller@0
+    displayName: 'Use NuGet 4.4.1'
+    inputs:
+      versionSpec: 4.4.1
+
+  - task: NuGetCommand@2
+    displayName: 'NuGet restore'
+    inputs:
+      restoreSolution: '$(solution)'
+
+  - task: TotalALM.totalalm-tokenization.tokenization-build-task.Tokenization@2
+    displayName: 'Tokenization: Transform file ServiceConfiguration.Cloud.cscfg,web.config'
+    inputs:
+      SourcePath: '$(build.sourcesdirectory)'
+      TargetFileNames: 'ServiceConfiguration.Cloud.cscfg,web.config'
+      
+  - task: VSBuild@1
+    displayName: 'Build solution **\*.sln'
+    inputs:
+      solution: '$(solution)'
+      platform: '$(buildPlatform)'
+      configuration: '$(buildConfiguration)'
+
+  - task: VSBuild@1
+    displayName: 'Build solution **\*.ccproj'
+    inputs:
+      solution: '$(cloudServiceProject)'
+      msbuildArgs: '/t:Publish /p:TargetProfile=$(targetProfile) /p:DebugType=None /p:SkipInvalidConfigurations=true /p:OutputPath=bin\ /p:PublishDir="$(build.artifactstagingdirectory)\\"'
+      platform: '$(buildPlatform)'
+      configuration: '$(buildConfiguration)'
+
+  - task: PublishSymbols@2
+    displayName: 'Publish symbols path'
+    inputs:
+      SearchPattern: '**\bin\**\*.pdb'
+      PublishSymbols: false
+    continueOnError: true
+ 
+  - task: PublishPipelineArtifact@1
+    inputs:
+      targetPath: '$(Pipeline.Workspace)'
+      artifact: 'cloudserviceproject'
+      publishLocation: 'pipeline'
+
+- deployment: DeployCloudServiceForSwap
+  dependsOn: cloudservicebuildforswap
+  displayName: deploy Cloud Services Extended Support
+  pool:
+    vmImage: 'windows-latest'
+  # Creates an environment if it doesn't exist.
+  environment: 'cloudservicedeployforswap'
+  strategy:
+    # Default deployment strategy, more coming...
+    runOnce:
+      deploy:
+        steps:
+        # Copy package file to blob storage
+        - task: AzureFileCopy@4
+          name: 'UploadCSPkg'
+          displayName: 'AzureBlob File Copy'
+          inputs:
+            SourcePath: '$(Pipeline.Workspace)\cloudserviceproject\a\CloudServiceForSwap.cspkg'
+            azureSubscription: '{your Azure subscription service connection here}'
+            Destination: AzureBlob
+            storage: {your Azure storage account name}
+            ContainerName: psdeploy
+            BlobPrefix: CloudServiceForSwap.cspkg
+        # Update cloud service extended support instance
+        - task: AzurePowerShell@5
+          displayName: 'Azure PowerShell script: InlineScript'
+          inputs:
+            azureSubscription: '{your Azure subscription service connection here}'
+            ScriptType: InlineScript
+            Inline: |
+              # Retrieve both cloud services
+              $cloudService1 = Get-AzCloudService -ResourceGroupName $(ResourceGroupName) -CloudServiceName $(CloudService1Name)
+              $cloudService2 = Get-AzCloudService -ResourceGroupName $(ResourceGroupName) -CloudServiceName $(CloudService2Name)
+
+              # Get the public IP address of each cloud service
+              $pipResource1 = Get-AzResource -ResourceId $cloudService1.NetworkProfile.LoadBalancerConfiguration[0].FrontendIPConfiguration[0].PublicIPAddressId
+              $pipResource2 = Get-AzResource -ResourceId $cloudService2.NetworkProfile.LoadBalancerConfiguration[0].FrontendIPConfiguration[0].PublicIPAddressId
+              $csIPAddress1 = Get-AzPublicIPAddress -Name $pipResource1.Name -ResourceGroupName $pipResource1.ResourceGroupName
+              $csIPAddress2 = Get-AzPublicIPAddress -Name $pipResource2.Name -ResourceGroupName $pipResource2.ResourceGroupName
+
+              # Determine which cloud service is the staging cloud service based on the DomainNameLabel of the public IP address
+              if ($csIPAddress1.DnsSettings.DomainNameLabel.Contains('stage'))
+              {
+                $cloudService = $cloudService1
+              }
+              elseif ($csIPAddress2.DnsSettings.DomainNameLabel.Contains('stage'))
+              {
+                $cloudService = $cloudService2
+              }
+
+              # Preserve the virtual network name of the cloud service we are deploying to
+              $xml = [xml]$cloudService.Configuration
+              $networkName = $xml.ServiceConfiguration.NetworkConfiguration.VirtualNetworkSite.name
+              if ($xml.ServiceConfiguration.Role.ConfigurationSettings.Setting.name.Contains('Diagnostics.ConnectionString'))
+              {
+                $diagConnectionString = $xml.ServiceConfiguration.Role.ConfigurationSettings.Setting.value
+              }
+
+              # Get the URL of the package file
+              $cspkgUrl = '$(UploadCSPkg.StorageContainerUri)$(PackageFileName)$(UploadCSPkg.StorageContainerSasToken)'
+
+              # Retrieve the contents of the configuration file
+              $configuration = Get-Content -Path '$(Pipeline.Workspace)\cloudserviceproject\a\ServiceConfiguration.Cloud.cscfg' | Out-String
+
+              Write-Output $configuration
+
+              $xmlConfig = [xml]$configuration
+              $xmlConfig.ServiceConfiguration.NetworkConfiguration.VirtualNetworkSite.name = $networkName
+              $xmlConfig.ServiceConfiguration.Role.ConfigurationSettings.Setting.value = $diagConnectionString
+              $xmlConfig.PreserveWhiteSpace = $true
+              $configuration = $xmlConfig.OuterXml
+
+              Write-Output $configuration
+
+              # Update the cloud service
+              $cloudService.Configuration = $configuration
+              $cloudService.PackageUrl = $cspkgUrl
+              $cloudService | Update-AzCloudService
+
+              Write-Output $cloudService.Name
+            azurePowerShellVersion: LatestVersion
+
+- deployment: SwapCloudService
+  dependsOn: DeployCloudServiceForSwap
+  displayName: Swap Cloud Services Staging instance to Production instance
+  pool:
+    vmImage: 'windows-latest'
+  # Creates an environment if it doesn't exist.
+  environment: 'cloudservicedeployprod'
+  strategy:
+    # Default deployment strategy, more coming...
+    runOnce:
+      deploy:
+        steps:
+        # Swap cloud services
+        - task: AzurePowerShell@5
+          displayName: 'Azure PowerShell script: InlineScript'
+          inputs:
+            azureSubscription: '{your Azure subscription service connection here}'
+            ScriptType: InlineScript
+            Inline: |
+              # Initiate a swap on the paired cloud services
+              Switch-AzCloudService -ResourceGroupName $(ResourceGroupName) -CloudServiceName $(CloudService1Name) -Confirm:$false
+            azurePowerShellVersion: LatestVersion
